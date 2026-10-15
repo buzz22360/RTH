@@ -1,0 +1,465 @@
+-- RTH GPS SOL 0.3.1 - prototype au sol. Source bornee, aucun mixage cree.
+-- Lecture directe par nom; ne modifie jamais un capteur.
+local VERSION = '0.3.1'
+local OUTPUT_LIMIT=30
+local PULSE_SECONDS=5
+local COMMAND_SCALE=6 -- Double la commande 0.3.0, limite +/-30 %
+local names = {heading='Course GPS', altitude='Altitude', speed='Vitesse GPS', satellites='GPS Satellites', roll='Roulis'}
+local function finite(x)
+  return type(x)=='number' and x==x and math.abs(x)<math.huge
+end
+local function call(s, method)
+  if not s then return nil end
+  local ok,v=pcall(function() return s[method](s) end)
+  if ok then return v end
+end
+local function source(name, option)
+  local ok,s=pcall(function() return system.getSource({name=name, options=option}) end)
+  if ok then return s end
+end
+local function number(s)
+  local v=call(s,'value')
+  if finite(v) then return v end
+end
+-- Pourcentage explicite seulement; aucune inference d'echelle brute.
+local function percent(s)
+  local v=number(s)
+  if UNIT_PERCENT and call(s,'unit')==UNIT_PERCENT and finite(v) then return v end
+  local text=call(s,'stringValue')
+  local token=type(text)=='string' and text:match('^%s*([+-]?%d+[.,]?%d*)%s*%%%s*$')
+  local value=token and tonumber((token:gsub(',','.')))
+  if finite(value) then return value end
+end
+-- SC physique: valeurs brutes -100/0/+100 confirmees sur cette radio.
+-- Repli limite aux trois positions mesurees; aucune conversion 1024 implicite.
+local function scPercent()
+  local s=source('SC')
+  local p=percent(s)
+  if finite(p) and math.abs(p)<=100 then return p end
+  local raw=number(s)
+  if raw==-100 or raw==0 or raw==100 then return raw end
+end
+local function fmt(v,n,unit)
+  if not finite(v) then return '---' end
+  return string.format('%.'..n..'f%s',v,unit or '')
+end
+local function norm(a) return (a+180)%360-180 end
+local function position(lat,lon)
+  return finite(lat) and finite(lon) and math.abs(lat)<=90 and math.abs(lon)<=180
+    and not (lat==0 and lon==0)
+end
+local function navigation(lat,lon,hlat,hlon,heading)
+  local r=math.pi/180
+  local a,b=lat*r,hlat*r
+  local dl=norm(hlon-lon)*r
+  local h=math.sin((b-a)/2)^2+math.cos(a)*math.cos(b)*math.sin(dl/2)^2
+  h=math.max(0,math.min(1,h))
+  local distance=2*6371000*math.atan(math.sqrt(h),math.sqrt(1-h))
+  if distance<0.01 then return distance,nil,nil end
+  local bearing=(math.atan(math.sin(dl)*math.cos(b),math.cos(a)*math.sin(b)-math.sin(a)*math.cos(b)*math.cos(dl))/r)%360
+  local error=finite(heading) and norm(bearing-heading) or nil
+  return distance,bearing,error
+end
+local function speedKmh(v,unit)
+  if not finite(v) then return nil end
+  if UNIT_KILOMETER_PER_HOUR and unit==UNIT_KILOMETER_PER_HOUR then return v end
+  if UNIT_KNOT and unit==UNIT_KNOT then return v*1.852 end
+  if UNIT_METER_PER_SECOND and unit==UNIT_METER_PER_SECOND then return v*3.6 end
+  if UNIT_MILE_PER_HOUR and unit==UNIT_MILE_PER_HOUR then return v*1.609344 end
+  return nil -- Ne jamais supposer l'unite d'une vitesse.
+end
+-- Cap de deplacement uniquement: positions distinctes, base >=5 m,
+-- intervalle 0.25..2.5 s, lissage circulaire 85% nouvelle mesure.
+local function motion(w,d,now)
+  local t=w.track
+  if not finite(now) or not d.posOK or d.speed.state~=true or not d.speedKmh or d.speedKmh<10 then
+    w.track=nil; d.trackReason='DEPLACEMENT INSUFFISANT'; return
+  end
+  if not t or now<t.time or now-t.time>2.5 then
+    t={points={},time=now}; w.track=t
+  end
+  d.trackReason='ATTENTE DEPLACEMENT GPS'
+  if not t.lat or d.lat~=t.lat or d.lon~=t.lon then
+    local points={}
+    for _,v in ipairs(t.points) do if now-v.time<=2.5 then points[#points+1]=v end end
+    local origin,span,course
+    for i=#points,1,-1 do
+      local v=points[i]; local dt=now-v.time
+      local length,angle=navigation(v.lat,v.lon,d.lat,d.lon)
+      if dt>=0.25 and length>=5 then
+        if length>200/3.6*dt+10 then
+          w.track=nil; d.trackReason='SAUT GPS'; return
+        end
+        origin=v; span=length; course=angle; break
+      end
+    end
+    if origin then
+      d.newMotion=true
+      t.rawCourse=course
+      local old=t.course
+      if old and t.validTime and now-t.validTime<=2 then
+        local r=math.pi/180
+        course=(math.atan(0.85*math.sin(course*r)+0.15*math.sin(old*r),
+          0.85*math.cos(course*r)+0.15*math.cos(old*r))/r)%360
+      end
+      t.course=course; t.validTime=now; t.span=span; t.duration=now-origin.time
+    end
+    if not points[#points] or now-points[#points].time>=0.25 then
+      points[#points+1]={lat=d.lat,lon=d.lon,time=now}
+    end
+    t.points=points; t.lat=d.lat; t.lon=d.lon
+  end
+  t.time=now
+  if t.validTime and now-t.validTime<=2 then
+    d.rawHeading=t.rawCourse; d.motionHeading=t.course; d.trackSpan=t.span; d.trackDuration=t.duration
+    d.trackAge=now-t.validTime; d.trackReason='CAP DEPLACEMENT CALCULE'
+  end
+end
+-- Etude passive uniquement. Gains hypotheses, pas de calibration avion.
+local function candidate(d,turnZone,alignedZone)
+  d.aileronCandidate=nil; d.bankTarget=nil
+  d.referenceTarget=nil; d.referenceRaw=nil; d.referenceCandidate=nil; d.referenceLimited=nil
+  d.legacyCandidate=nil; d.holdTerm=nil; d.feedbackTerm=nil; d.unlimitedCandidate=nil; d.candidateLimited=nil
+  d.candidateReason='NAVIGATION INDISPONIBLE'
+  if not finite(d.error) then return end
+  d.candidateReason='MODE NON CONFIGURE'
+  if not finite(d.modeValue) then return end
+  d.candidateReason='REMISE A PLAT NON SELECTIONNEE'
+  if d.modeValue>=0 then return end
+  d.candidateReason='ROULIS INDISPONIBLE'
+  if not d.roll or d.roll.state~=true or not finite(d.roll.value) then return end
+  d.candidateReason='UNITE ROULIS A VERIFIER'
+  if not UNIT_DEGREE or d.roll.unit~=UNIT_DEGREE then return end
+  d.candidateReason='INCLINAISON >=30 DEG'
+  if math.abs(d.roll.value)>=30 then return end
+  d.candidateReason='DEMI-TOUR AMBIGU'
+  if turnZone then return end
+  d.referenceTarget=alignedZone and 0 or math.max(-15,math.min(15,0.25*d.error))
+  d.referenceRaw=1.5*d.referenceTarget+0.5*(d.referenceTarget-d.roll.value)
+  d.referenceCandidate=math.max(-10,math.min(10,d.referenceRaw))
+  d.referenceLimited=math.abs(d.referenceRaw)>10
+  d.bankTarget=alignedZone and 0 or math.max(-5,math.min(5,0.25*d.error))
+  -- Hypothese de maintien: 1.5 % de manche par degre cible, non calibree.
+  d.holdTerm=COMMAND_SCALE*1.5*d.bankTarget
+  d.feedbackTerm=COMMAND_SCALE*0.5*(d.bankTarget-d.roll.value)
+  d.legacyCandidate=math.max(-10,math.min(10,0.5*(d.referenceTarget-d.roll.value)))
+  d.unlimitedCandidate=d.holdTerm+d.feedbackTerm
+  d.aileronCandidate=math.max(-OUTPUT_LIMIT,math.min(OUTPUT_LIMIT,d.unlimitedCandidate))
+  d.candidateLimited=math.abs(d.unlimitedCandidate)>OUTPUT_LIMIT
+  d.candidateReason=d.candidateLimited and 'HYPOTHESE LIMITEE' or 'HYPOTHESE MAINTIEN'
+end
+local function create()
+  return {aileronSource=source('Aileron'),data={},home=nil,homeSwitch=nil,previous=nil,status='ATTENTE',capture='Home non memorise',logSwitch=nil,logPrevious=false,logStatus='LOG ARRETE',logCount=0,homeRevision=0}
+end
+-- CSV: chaque nouveau cap + une ligne/seconde sans nouveau cap + evenements.
+-- Fichier ferme apres chaque ligne; aucun handle conserve entre wakeup.
+local LOG_DIR='/scripts/rthgp31/'
+local HEADER='version;date_radio;heure_radio;sequence;evenement;etat;home_revision;latitude_deg;longitude_deg;home_latitude_deg;home_longitude_deg;distance_home_m;cap_gps_deg;cap_retour_deg;ecart_route_deg;correction_valide;correction_proposee;vitesse_kmh;satellites;altitude_texte;commandes_appliquees;cap_deplacement_deg;base_deplacement_m;intervalle_deplacement_s;age_cap_s;etat_cap_deplacement;temps_ecoule_s;horloge_monotone_s;cap_deplacement_brut_deg;ecart_brut_deg;demi_tour_zone;roulis_deg;mode_source_valeur;inclinaison_cible_deg;commande_ailerons_proposee_pct;commande_proposee_valide;motif_commande;manche_ailerons_brut;manche_ailerons_unite;manche_ailerons_texte;manche_ailerons_pct;roulis_etat;ancienne_commande_pct;maintien_theorique_pct;correction_roulis_pct;commande_avant_limite_pct;commande_limitee;cible_reference_v114_deg;commande_reference_v114_pct;avant_limite_reference_v114_pct;reference_v114_limitee;manche_ailerons_pct_origine;source_rth_pct;etat_source_rth;sc_brut;sc_pct;sh_brut;limite_sortie_pct;facteur_commande;duree_impulsion_max_s\n'
+local function csv(v)
+  if v==nil then return '' end
+  if type(v)=='number' and not finite(v) then return '' end
+  local t=tostring(v)
+  if t:find('[;"\r\n]') then return '"'..t:gsub('"','""')..'"' end
+  return t
+end
+local function num(v,n) return finite(v) and string.format('%.'..n..'f',v) or '' end
+local function stamp()
+  local ok,t=pcall(function() return os.date('*t') end)
+  if not ok or type(t)~='table' then
+    ok,t=pcall(function() return os.date() end)
+  end
+  if not ok or type(t)~='table' then return nil end
+  for _,k in ipairs({'year','month','day','hour','min','sec'}) do
+    if not finite(t[k]) then return nil end
+  end
+  return string.format('%04d-%02d-%02d',t.year,t.month,t.day),string.format('%02d:%02d:%02d',t.hour,t.min,t.sec)
+end
+local function suggestion(e)
+  if not finite(e) then return 'INDISPONIBLE' end
+  if math.abs(e)>=175 then return 'DEMI-TOUR (sens a choisir)' end
+  if math.abs(e)<5 then return 'ALIGNE' end
+  return (e>0 and 'DROITE ' or 'GAUCHE ')..fmt(math.abs(e),1,' deg')
+end
+-- Hysteresis de la zone ambigue: entree >=170, sortie <=155 deg.
+-- Aucun sens arbitraire impose lors d'un demi-tour.
+local function stableSuggestion(w,e)
+  if not finite(e) then w.turnZone=false; w.alignedZone=false; return 'INDISPONIBLE' end
+  if w.turnZone then
+    if math.abs(e)<=155 then w.turnZone=false end
+  elseif math.abs(e)>=170 then w.turnZone=true end
+  if w.turnZone then w.alignedZone=false; return 'DEMI-TOUR (sens a choisir)' end
+  -- Entree stricte sous 5 deg ; sortie a 10 deg inclus, sans temporisation.
+  if w.alignedZone then
+    if math.abs(e)>=10 then w.alignedZone=false end
+  elseif math.abs(e)<5 then w.alignedZone=true end
+  if w.alignedZone then return 'ALIGNE' end
+  return suggestion(e)
+end
+local function append(path,line)
+  local file
+  local ok,err=pcall(function()
+    file=assert(io.open(path,'a'))
+    assert(file:write(line))
+    local result,closeError=file:close(); file=nil
+    -- ETHOS peut ne renvoyer aucune valeur sur une fermeture reussie.
+    -- Conserver les erreurs explicites et les exceptions (capturees par pcall).
+    if result==false or (result==nil and closeError~=nil) then
+      error(closeError or 'Echec fermeture CSV')
+    end
+  end)
+  if file then pcall(function() file:close() end) end
+  return ok,err
+end
+local function failLog(w,err)
+  w.logPath=nil; w.logStatus='ERREUR LOG - voir notice'; w.logError=tostring(err)
+end
+local function startLog(w,date,time)
+  -- Append seulement: meme un echec du test d'existence ne tronque aucun fichier.
+  local stem='RTH_'..date:gsub('-','')..'_'..time:gsub(':','')
+  for i=1,99 do
+    local filename=stem..string.format('_%02d.csv',i)
+    local path=LOG_DIR..filename
+    local ok,f=pcall(function() return io.open(path,'r') end)
+    if not ok then failLog(w,f); return end
+    if f then pcall(function() f:close() end)
+    else
+      local success,err=append(path,HEADER)
+      if not success then failLog(w,err); return end
+      w.logPath=path; w.logFilename=filename; w.logCount=0; w.logError=nil; w.logStart=w.data.sampleClock
+      return
+    end
+  end
+  failLog(w,'99 fichiers portent cette date/heure')
+end
+local function logRow(w,date,time,event)
+  local d=w.data; local home=w.home or {}
+  local values={VERSION,date,time,w.logCount+1,event,w.status,w.homeRevision,
+    num(d.lat,7),num(d.lon,7),num(home.lat,7),num(home.lon,7),num(d.distance,2),
+    num(d.heading.value,2),num(d.bearing,2),num(d.error,2),finite(d.error) and 1 or 0,
+    d.proposal or suggestion(d.error),num(d.speedKmh,3),num(d.satellites.value,0),d.altitude.text,'SOURCE_LUA_SEULE',num(d.motionHeading,2),num(d.trackSpan,2),num(d.trackDuration,2),num(d.trackAge,2),d.trackReason or 'ATTENTE',num(d.sampleClock and w.logStart and d.sampleClock-w.logStart,2),num(d.sampleClock,2),num(d.rawHeading,2),num(d.rawError,2),w.turnZone and 1 or 0,num(d.roll and d.roll.value,2),num(d.modeValue,3),num(d.bankTarget,2),num(d.aileronCandidate,2),finite(d.aileronCandidate) and 1 or 0,d.candidateReason or 'ATTENTE',num(d.stickValue,3),d.stickUnit or '',d.stickText or '',num(d.stickPercent,3),tostring(d.roll and d.roll.state),num(d.legacyCandidate,2),num(d.holdTerm,2),num(d.feedbackTerm,2),num(d.unlimitedCandidate,2),finite(d.aileronCandidate) and (d.candidateLimited and 1 or 0) or '',num(d.referenceTarget,2),num(d.referenceCandidate,2),num(d.referenceRaw,2),finite(d.referenceCandidate) and (d.referenceLimited and 1 or 0) or '',d.stickPercentOrigin or 'INDISPONIBLE',num(w.outputPercent,3),w.controlReason or 'INIT',num(number(source('SC')),3),num(d.scPercent,3),num(d.shValue,3),OUTPUT_LIMIT,COMMAND_SCALE,PULSE_SECONDS}
+  for i=1,#values do values[i]=csv(values[i]) end
+  local ok,err=append(w.logPath,table.concat(values,';')..'\n')
+  if not ok then failLog(w,err); return false end
+  w.logCount=w.logCount+1; w.logStamp=date..' '..time
+  w.logStatus='LOG ON - '..w.logCount..' lignes'
+  return true
+end
+local function updateLog(w)
+  local sv=number(w.logSwitch); local active=finite(sv) and sv>0
+  local date,time=stamp()
+  if active and not w.logPrevious then
+    if date then startLog(w,date,time) else failLog(w,'Horloge radio indisponible') end
+    if w.logPath then logRow(w,date,time,'DEBUT') end
+  elseif w.logPath then
+    if not date then failLog(w,'Horloge radio indisponible')
+    elseif not active then
+      if logRow(w,date,time,'FIN') then w.logStatus='LOG FERME - '..w.logCount..' lignes'; w.logPath=nil end
+    elseif w.homeEvent or w.data.newMotion or w.logStamp~=date..' '..time then
+      logRow(w,date,time,w.homeEvent or (w.data.newMotion and 'CAP' or 'MESURE'))
+    end
+  end
+  w.logPrevious=active
+end
+
+local function wakeupBody(w)
+  local d={}
+  w.homeEvent=nil
+  for key,name in pairs(names) do
+    local s=source(name)
+    local state=call(s,'state')
+    local val=number(s)
+    local text=call(s,'stringValue')
+    d[key]={value=val,text=type(text)=='string' and text or fmt(val,2),state=state,unit=call(s,'unit')}
+    if state==false then d[key].value=nil; d[key].text='--- (inactif)' end
+  end
+  local latSource=OPTION_LATITUDE and source('GPS',OPTION_LATITUDE)
+  local lonSource=OPTION_LONGITUDE and source('GPS',OPTION_LONGITUDE)
+  d.lat=number(latSource); d.lon=number(lonSource)
+  local ls,lonState=call(latSource,'state'),call(lonSource,'state')
+  d.posOK=position(d.lat,d.lon) and ls==true and lonState==true and d.satellites.state==true
+    and finite(d.satellites.value) and d.satellites.value>=6
+  d.speedKmh=speedKmh(d.speed.value,d.speed.unit)
+  local clockOK,now=pcall(function() return os.clock() end)
+  d.sampleClock=clockOK and finite(now) and now or nil
+  motion(w,d,d.sampleClock)
+  local sw=number(w.homeSwitch)
+  local active=finite(sw) and sw>0
+  if w.previous==false and active then
+    -- Etat frais requis pour memorisation. Aucun Home automatique au demarrage.
+    if d.posOK and ls==true and lonState==true and (scPercent() or 0)<-50 and (number(source('SK')) or -1)>=0 then
+      w.home={lat=d.lat,lon=d.lon}; w.capture='Home memorise'; w.homeRevision=w.homeRevision+1; w.homeEvent='HOME_MEMORISE'
+    else w.capture='Home refuse: GPS, SC haut et SK bas requis'; w.homeEvent='HOME_REFUSE' end
+  end
+  w.previous=active
+  w.status='POSITION GPS ABSENTE'
+  if d.posOK then
+    w.status='MEMORISER HOME'
+    if w.home then
+      local heading=d.motionHeading
+      d.distance,d.bearing,d.error=navigation(d.lat,d.lon,w.home.lat,w.home.lon,heading)
+      w.status=d.trackReason or 'CAP DEPLACEMENT ABSENT'
+      if d.distance<=25 then w.status='ZONE HOME (25 m)'; d.error=nil
+      elseif not d.speedKmh then w.status='UNITE VITESSE A VERIFIER'; d.error=nil
+      elseif d.speedKmh<10 then w.status='CAP PEU FIABLE (<10 km/h)'; d.error=nil
+      elseif heading then w.status='CALCUL INDICATIF' end
+      if ls~=true or lonState~=true or d.speed.state~=true then
+        w.status='ETAT TELEMETRIE A VERIFIER'; d.error=nil
+      end
+    end
+  end
+  if finite(d.bearing) and finite(d.rawHeading) then d.rawError=norm(d.bearing-d.rawHeading) end
+  d.proposal=stableSuggestion(w,d.error)
+  d.modeValue=number(w.modeSource)
+  -- Lecture physique sans filtrage par state(): false peut etre un etat logique.
+  d.stickValue=number(w.aileronSource)
+  d.stickUnit=call(w.aileronSource,'unit')
+  local stickText=call(w.aileronSource,'stringValue')
+  d.stickText=type(stickText)=='string' and stickText or nil
+  if UNIT_PERCENT and d.stickUnit==UNIT_PERCENT and finite(d.stickValue) then
+    d.stickPercent=d.stickValue
+    d.stickPercentOrigin='UNITE_PERCENT'
+  elseif d.stickText then
+    -- Repli sur le pourcentage explicite affiche par ETHOS (precision du texte).
+    local token=d.stickText:match('^%s*([+-]?%d+[.,]?%d*)%s*%%%s*$')
+    local value=token and tonumber((token:gsub(',','.')))
+    if finite(value) then
+      d.stickPercent=value
+      d.stickPercentOrigin='TEXTE_PERCENT'
+    end
+  end
+  -- Aucune conversion implicite de la valeur brute.
+  -- Inter physique: conserver la valeur signee, comme pour SH et SB.
+  candidate(d,w.turnZone,w.alignedZone)
+  if not finite(d.error) then d.candidateReason=w.status end
+  d.scPercent=scPercent(); d.shValue=number(w.homeSwitch)
+  w.data=d
+  -- Journalisation apres calcul de la source dans le callback source.
+end
+-- Controleur independant de l'affichage. Un cycle manquant >0.5s verrouille.
+local function newControl() return {armed=false} end
+local function stop(c,reason)
+  c.armed=false; c.started=nil; c.sign=nil
+  return 0,reason
+end
+local function control(c,i)
+  if not finite(i.now) then return stop(c,'HORLOGE INVALIDE') end
+  local gap=c.last and (i.now<c.last or i.now-c.last>0.5)
+  c.last=i.now
+  if gap then return stop(c,'CYCLE INTERROMPU') end
+  if not finite(i.sc) or not finite(i.sk) or not finite(i.ail) or not finite(i.sh) then
+    return stop(c,'INTER/MANCHE ABSENT')
+  end
+  if i.sc < -50 then
+    c.started=nil; c.sign=nil
+    c.armed=i.sk<0 and math.abs(i.ail)<=10 and i.sh<=0 and i.valid==true
+    return 0,c.armed and 'PRET - SC BAS POUR IMPULSION' or 'REPOS - '..(i.reason or 'INHIBE')
+  end
+  -- Le milieu conserve seulement un armement acquis en haut, avant impulsion.
+  if i.sc<=50 and c.started then return stop(c,'SC INTERMEDIAIRE - COUPURE') end
+  if i.sk>=0 then return stop(c,'SK COUPE') end
+  if i.sh>0 then return stop(c,'HOME ACTIONNE') end
+  if math.abs(i.ail)>10 then return stop(c,'PRIORITE PILOTE') end
+  if i.valid~=true or not finite(i.command) then return stop(c,i.reason or 'NAVIGATION INVALIDE') end
+  if i.sc<=50 then
+    return 0,c.armed and 'PRET - SC INTERMEDIAIRE' or 'REARMER SC EN HAUT'
+  end
+  if not c.armed then return 0,'REARMER SC EN HAUT' end
+  if not c.started then c.started=i.now end
+  if i.now-c.started>=PULSE_SECONDS then return stop(c,'FIN IMPULSION 5s') end
+  local v=math.max(-OUTPUT_LIMIT,math.min(OUTPUT_LIMIT,i.command))
+  local sign=v>0 and 1 or (v<0 and -1 or 0)
+  if c.sign and sign~=0 and sign~=c.sign then return stop(c,'CHANGEMENT SENS - REARMER') end
+  if sign~=0 then c.sign=sign end
+  return v,'IMPULSION SOL'
+end
+local state, controller, busy
+local function getState()
+  if not state then state=create(); state.outputPercent=0; controller=newControl() end
+  return state
+end
+local function sourceInit(s)
+  state=nil; controller=nil; busy=false
+  getState(); s:value(0)
+end
+local function sourceWakeup(s)
+  local w=getState()
+  if busy then
+    stop(controller,'REENTRANCE'); w.outputPercent=0; s:value(0); return
+  end
+  busy=true
+  local ok,err=pcall(function()
+    w.homeSwitch=source('SH'); w.logSwitch=source('SB')
+    w.modeSource=source('SK'); w.aileronSource=source('Aileron')
+    wakeupBody(w)
+    local d=w.data
+    local valid=finite(d.aileronCandidate) and d.posOK==true and w.home~=nil
+      and finite(d.trackAge) and d.trackAge<=2
+    local pct,reason=control(controller,{now=d.sampleClock,sc=d.scPercent,
+      sk=d.modeValue,sh=d.shValue,ail=d.stickPercent,valid=valid,
+      command=d.aileronCandidate,reason=d.candidateReason})
+    w.outputPercent=pct; w.controlReason=reason; w.lastUpdate=d.sampleClock
+    s:value(pct*10.24)
+    -- Tout changement de sortie est consigne, pas seulement les caps GPS.
+    if w.lastLoggedOutput~=pct or w.lastLoggedReason~=reason then
+      w.homeEvent=w.homeEvent or 'COMMANDE_SOURCE'
+    end
+    updateLog(w)
+    w.lastLoggedOutput=pct; w.lastLoggedReason=reason
+  end)
+  if not ok then
+    stop(controller,'ERREUR LUA'); w.outputPercent=0; w.controlReason='ERREUR LUA'
+    w.track=nil; w.data={}; w.status='ERREUR LUA'; w.logError=tostring(err)
+    s:value(0)
+  end
+  busy=false
+end
+-- Ecran de suivi : lecture seule, ne fait jamais tourner le controleur.
+local function screenStatus()
+  local w=getState()
+  local ok,now=pcall(os.clock)
+  if not ok or not finite(now) or not w.lastUpdate or now<w.lastUpdate or now-w.lastUpdate>0.5 then
+    return w,'SOURCE INACTIVE / NON ACTUALISEE',false
+  end
+  return w,w.controlReason or 'ATTENTE',true
+end
+local function paint()
+  local width,height=lcd.getWindowSize()
+  lcd.color(lcd.RGB(20,27,36));lcd.drawFilledRectangle(0,0,width,height)
+  lcd.font(FONT_S);lcd.color(lcd.RGB(255,255,255))
+  lcd.drawText(8,6,'RTH GPS 0.3.1 | +/-30% | 5 SECONDES',TEXT_LEFT)
+  local w,status,fresh=screenStatus();local d=w.data or {}
+  local rows={
+    status,
+    'Sortie Lua : '..(fresh and fmt(w.outputPercent,1,' %') or '---'),
+    'Navigation : '..(w.status or 'ATTENTE'),
+    'Home : '..(w.home and fmt(d.distance,1,' m') or 'A MEMORISER'),
+    'Vitesse : '..fmt(d.speedKmh,1,' km/h')..' | Sat : '..fmt(d.satellites and d.satellites.value,0),
+    'Roulis : '..fmt(d.roll and d.roll.value,1,' deg')..' | Cible : '..fmt(d.bankTarget,1,' deg'),
+    'SC : '..fmt(d.scPercent,0)..' | SK : '..fmt(d.modeValue,0)..' | Manche : '..fmt(d.stickPercent,0,' %'),
+    w.logStatus or 'LOG ARRETE',
+    (w.logError or w.logFilename or 'SB bas : enregistrer'):sub(1,64)
+  }
+  if width<450 or height<250 then
+    rows={status,'Sortie : '..(fresh and fmt(w.outputPercent,1,' %') or '---'),'Agrandir ce widget'}
+  end
+  local step=math.max(18,math.floor((height-55)/#rows))
+  lcd.font(FONT_XS)
+  for i,line in ipairs(rows) do
+    if i==1 then lcd.color(lcd.RGB(255,205,70)) else lcd.color(lcd.RGB(240,240,240)) end
+    lcd.drawText(8,34+(i-1)*step,line,TEXT_LEFT)
+  end
+end
+local function widgetWakeup(w)
+  local now=os.clock()
+  if not w.lastPaint or now<w.lastPaint or now-w.lastPaint>=0.25 then
+    w.lastPaint=now;lcd.invalidate()
+  end
+end
+local function init()
+  system.registerSource({key='rthgp31',name='RTH GPS SOL 0.3.1',init=sourceInit,wakeup=sourceWakeup})
+  system.registerWidget({key='rthmn31',name='RTH Etat 0.3.1',create=function()return {}end,
+    wakeup=widgetWakeup,paint=paint,persistent=true,title=false})
+end
+return {init=init,_test={control=control,newControl=newControl,getState=getState,
+  sourceInit=sourceInit,sourceWakeup=sourceWakeup,navigation=navigation,candidate=candidate,
+  screenStatus=screenStatus,paint=paint}}
